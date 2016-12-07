@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 
 	. "github.com/cloudfoundry/bosh-utils/blobstore"
+	boshcrypto "github.com/cloudfoundry/bosh-utils/crypto"
+	boshcryptofake "github.com/cloudfoundry/bosh-utils/crypto/fakes"
 	boshlog "github.com/cloudfoundry/bosh-utils/logger"
 	boshsys "github.com/cloudfoundry/bosh-utils/system"
 	boshsysfake "github.com/cloudfoundry/bosh-utils/system/fakes"
@@ -16,12 +18,13 @@ import (
 
 var _ = Describe("Blob Manager", func() {
 	var (
-		fs       boshsys.FileSystem
-		logger   boshlog.Logger
-		basePath string
-		blobPath string
-		blobId   string
-		toWrite  io.Reader
+		fs           boshsys.FileSystem
+		logger       boshlog.Logger
+		basePath     string
+		blobPath     string
+		blobId       string
+		toWrite      io.Reader
+		digestProvider *boshcryptofake.FakeDigestProvider
 	)
 
 	BeforeEach(func() {
@@ -31,6 +34,7 @@ var _ = Describe("Blob Manager", func() {
 		basePath = os.TempDir()
 		blobPath = filepath.Join(basePath, blobId)
 		toWrite = bytes.NewReader([]byte("new data"))
+		digestProvider = &boshcryptofake.FakeDigestProvider{}
 	})
 
 	readFile := func(fileIO boshsys.File) []byte {
@@ -41,7 +45,7 @@ var _ = Describe("Blob Manager", func() {
 	}
 
 	It("fetches", func() {
-		blobManager := NewBlobManager(fs, basePath)
+		blobManager := NewBlobManager(fs, digestProvider, basePath)
 		fs.WriteFileString(blobPath, "some data")
 
 		readOnlyFile, err, _ := blobManager.Fetch(blobId)
@@ -54,7 +58,7 @@ var _ = Describe("Blob Manager", func() {
 	})
 
 	It("writes", func() {
-		blobManager := NewBlobManager(fs, basePath)
+		blobManager := NewBlobManager(fs, digestProvider, basePath)
 		fs.WriteFileString(blobPath, "some data")
 		defer fs.RemoveAll(blobPath)
 
@@ -74,7 +78,7 @@ var _ = Describe("Blob Manager", func() {
 
 		It("creates and closes the file", func() {
 			fs_ := boshsysfake.NewFakeFileSystem()
-			blobManager := NewBlobManager(fs_, basePath)
+			blobManager := NewBlobManager(fs_, digestProvider, basePath)
 			err := blobManager.Write(blobId, toWrite)
 			Expect(err).ToNot(HaveOccurred())
 			fileStats, err := fs_.FindFileStats(blobPath)
@@ -84,7 +88,7 @@ var _ = Describe("Blob Manager", func() {
 
 		It("creates file with correct permissions", func() {
 			fs_ := boshsysfake.NewFakeFileSystem()
-			blobManager := NewBlobManager(fs_, basePath)
+			blobManager := NewBlobManager(fs_, digestProvider, basePath)
 			err := blobManager.Write(blobId, toWrite)
 			fileStats, err := fs_.FindFileStats(blobPath)
 			Expect(err).ToNot(HaveOccurred())
@@ -94,15 +98,18 @@ var _ = Describe("Blob Manager", func() {
 	})
 
 	Describe("GetPath", func() {
+		var sampleDigest boshcrypto.Digest
+
 		BeforeEach(func() {
 			blobId = "smurf-24"
+			sampleDigest = boshcrypto.NewDigest(boshcrypto.DigestAlgorithmSHA1, "smurf-sha1")
 		})
 
 		Context("when file requested does not exist in blobsPath", func() {
 			It("returns an error", func() {
-				blobManager := NewBlobManager(fs, basePath)
+				blobManager := NewBlobManager(fs, digestProvider, basePath)
 
-				_, err := blobManager.GetPath("iblob-id-does-not-exist")
+				_, err := blobManager.GetPath("blob-id-does-not-exist", sampleDigest)
 
 				Expect(err).ToNot(BeNil())
 				Expect(err.Error()).To(Equal("blob not found"))
@@ -110,18 +117,46 @@ var _ = Describe("Blob Manager", func() {
 		})
 
 		Context("when file requested exists in blobsPath", func() {
-			It("should return the path of a copy of the requested blob", func() {
-				blobManager := NewBlobManager(fs, basePath)
+			Context("when file checksum matches provided checksum", func() {
+				BeforeEach(func() {
+					digestProvider.CreateFromFileReturns(boshcrypto.NewDigest("sha1", "smurf-sha1"), nil)
+				})
 
-				err := fs.WriteFileString(filepath.Join(basePath, blobId), "smurf-content-hello")
-				defer fs.RemoveAll(blobPath)
+				It("should return the path of a copy of the requested blob", func() {
+					blobManager := NewBlobManager(fs, digestProvider, basePath)
 
-				Expect(err).To(BeNil())
+					err := fs.WriteFileString(filepath.Join(basePath, blobId), "smurf-content-hello")
+					defer fs.RemoveAll(blobPath)
 
-				filename, err := blobManager.GetPath(blobId)
-				Expect(err).To(BeNil())
-				Expect(fs.ReadFileString(filename)).To(Equal("smurf-content-hello"))
-				Expect(filename).ToNot(Equal(filepath.Join(blobPath, blobId)))
+					Expect(err).To(BeNil())
+
+					filename, err := blobManager.GetPath(blobId, sampleDigest)
+					Expect(err).To(BeNil())
+					Expect(fs.ReadFileString(filename)).To(Equal("smurf-content-hello"))
+					Expect(filename).ToNot(Equal(filepath.Join(blobPath, blobId)))
+				})
+			})
+
+			Context("when file checksum does NOT match provided checksum", func() {
+				BeforeEach(func() {
+					digestProvider.CreateFromFileReturns(boshcrypto.NewDigest("sha1", "wrong-smurf-sha1"), nil)
+				})
+
+				It("should return an error", func() {
+					blobManager := NewBlobManager(fs, digestProvider, basePath)
+
+					err := fs.WriteFileString(filepath.Join(basePath, blobId), "smurf-content-hello")
+					defer fs.RemoveAll(blobPath)
+
+					Expect(err).To(BeNil())
+
+					filename, err := blobManager.GetPath(blobId, sampleDigest)
+
+					Expect(err).ToNot(BeNil())
+					Expect(err.Error()).To(Equal(`Checking blob 'smurf-24': Expected sha1 digest "smurf-sha1" but received "wrong-smurf-sha1"`))
+
+					Expect(filename).To(Equal(""))
+				})
 			})
 		})
 	})
@@ -133,7 +168,7 @@ var _ = Describe("Blob Manager", func() {
 
 		Context("when file to be deleted does not exist in blobsPath", func() {
 			It("does not freak out", func() {
-				blobManager := NewBlobManager(fs, basePath)
+				blobManager := NewBlobManager(fs, digestProvider, basePath)
 
 				err := blobManager.Delete("hello-i-am-no-one")
 
@@ -147,7 +182,7 @@ var _ = Describe("Blob Manager", func() {
 				Expect(err).To(BeNil())
 				Expect(fs.FileExists(filepath.Join(basePath, blobId))).To(BeTrue())
 
-				blobManager := NewBlobManager(fs, basePath)
+				blobManager := NewBlobManager(fs, digestProvider, basePath)
 				err = blobManager.Delete(blobId)
 				Expect(err).To(BeNil())
 
@@ -163,7 +198,7 @@ var _ = Describe("Blob Manager", func() {
 
 		Context("when blob requested exists in blobsPath", func() {
 			It("returns true", func() {
-				blobManager := NewBlobManager(fs, basePath)
+				blobManager := NewBlobManager(fs, digestProvider, basePath)
 
 				err := fs.WriteFileString(filepath.Join(basePath, blobId), "super-smurf-content")
 				defer fs.RemoveAll(blobPath)
@@ -177,7 +212,7 @@ var _ = Describe("Blob Manager", func() {
 
 		Context("when blob requested does NOT exist in blobsPath", func() {
 			It("returns false", func() {
-				blobManager := NewBlobManager(fs, basePath)
+				blobManager := NewBlobManager(fs, digestProvider, basePath)
 				exists := blobManager.BlobExists("blob-id-does-not-exist")
 
 				Expect(exists).To(BeFalse())

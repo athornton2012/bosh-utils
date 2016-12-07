@@ -6,17 +6,22 @@ import (
 	"path"
 	"strings"
 
+	"fmt"
+
+	boshcrypto "github.com/cloudfoundry/bosh-utils/crypto"
 	bosherr "github.com/cloudfoundry/bosh-utils/errors"
 	boshsys "github.com/cloudfoundry/bosh-utils/system"
 )
 
 type BlobManager struct {
-	fs            boshsys.FileSystem
-	blobstorePath string
+	fs             boshsys.FileSystem
+	digestProvider boshcrypto.DigestProvider
+	blobstorePath  string
 }
 
-func NewBlobManager(fs boshsys.FileSystem, blobstorePath string) (manager BlobManager) {
+func NewBlobManager(fs boshsys.FileSystem, digestProvider boshcrypto.DigestProvider, blobstorePath string) (manager BlobManager) {
 	manager.fs = fs
+	manager.digestProvider = digestProvider
 	manager.blobstorePath = blobstorePath
 	return
 }
@@ -55,14 +60,27 @@ func (manager BlobManager) Write(blobID string, reader io.Reader) error {
 	return err
 }
 
-func (manager BlobManager) GetPath(blobID string) (string, error) {
-	localBlobPath := path.Join(manager.blobstorePath, blobID)
-
-	if !manager.fs.FileExists(localBlobPath) {
+func (manager BlobManager) GetPath(blobID string, digest boshcrypto.Digest) (string, error) {
+	if !manager.BlobExists(blobID) {
 		return "", bosherr.Error("blob not found")
 	}
 
-	return manager.copyToTmpFile(localBlobPath)
+	tempFilePath, err := manager.copyToTmpFile(path.Join(manager.blobstorePath, blobID))
+	if err != nil {
+		return "", err
+	}
+
+	actualDigest, err := manager.digestProvider.CreateFromFile(tempFilePath, digest.Algorithm())
+	if err != nil {
+		return "", err
+	}
+
+	err = digest.Verify(actualDigest)
+	if err != nil {
+		return "", bosherr.WrapError(err, fmt.Sprintf("Checking blob '%s'", blobID))
+	}
+
+	return tempFilePath, nil
 }
 
 func (manager BlobManager) Delete(blobID string) error {
